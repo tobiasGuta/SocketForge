@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<policy target="CONTINUE">
+  <short>SocketForge outbound rule scope</short>
+  <description>Provides a host-output scope for temporary SocketForge rules.</description>
+  <ingress-zone name="HOST"/>
+  <egress-zone name="ANY"/>
+</policy>

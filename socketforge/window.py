@@ -18,33 +18,14 @@ from .demo import collect_demo
 from .diagnostics import rates
 from .listeners import inspect_listener
 from .network import collect
+from .security_ui import SecurityViews
 from .timeline import Event, Session, clear_history, load_recent, save
+from .widgets import EventRow, box, endpoint_text, label
 
 REFRESH_INTERVAL = 2
 SCOPE_NAMES = ("All sockets", "TCP listeners", "Bound UDP")
 PROTOCOL_NAMES = ("All protocols", "TCP", "UDP")
 LOGGER = logging.getLogger(__name__)
-
-
-def box(*children, vertical=False, spacing=0, css=None):
-    orientation = Gtk.Orientation.VERTICAL if vertical else Gtk.Orientation.HORIZONTAL
-    widget = Gtk.Box(orientation=orientation, spacing=spacing)
-    for child in children:
-        widget.append(child)
-    if css:
-        widget.add_css_class(css)
-    return widget
-
-
-def label(text="", *classes):
-    widget = Gtk.Label(label=text, xalign=0)
-    for css_class in classes:
-        widget.add_css_class(css_class)
-    return widget
-
-
-def endpoint_text(endpoint):
-    return str(endpoint) if endpoint else "—"
 
 
 class SocketRow(GObject.Object):
@@ -54,22 +35,13 @@ class SocketRow(GObject.Object):
         self.search_text = connection.search_text
 
 
-class EventRow(GObject.Object):
-    def __init__(self, event):
-        super().__init__()
-        self.event = event
-        connection = event.connection.search_text if event.connection else ""
-        self.search_text = (
-            f"{event.kind} {event.detail} {event.source} {connection}".casefold()
-        )
-
-
-class Explorer(Adw.ApplicationWindow):
+class Explorer(SecurityViews, Adw.ApplicationWindow):
     def __init__(self, application, demo, trace=None):
         super().__init__(application=application, title="SocketForge")
         self.set_default_size(1120, 740)
         self.set_size_request(460, 440)
         self.demo = demo
+        self.init_security()
         self.trace = trace
         self.trace_dropped = 0
         self.trace_status = None
@@ -98,6 +70,8 @@ class Explorer(Adw.ApplicationWindow):
         self.toasts.set_child(toolbar)
         self.set_content(self.toasts)
         self.connect("close-request", self._close)
+        self._read_firewall()
+        self._read_host()
         self.timer = GLib.timeout_add_seconds(REFRESH_INTERVAL, self._tick)
         self._refresh()
 
@@ -109,6 +83,8 @@ class Explorer(Adw.ApplicationWindow):
 
         menu = Gio.Menu()
         if not self.demo:
+            menu.append("Temporary Firewall Blocks", "win.blocks")
+            menu.append("Quit SocketForge", "app.quit")
             menu.append("Saved Sessions", "win.history")
             menu.append("Clear Saved Sessions", "win.clear-history")
         menu.append("Keyboard Shortcuts", "win.shortcuts")
@@ -138,6 +114,7 @@ class Explorer(Adw.ApplicationWindow):
             ("shortcuts", self._show_shortcuts, "<Control>question"),
             ("about", self._show_about, None),
             ("history", self._show_history, None),
+            ("blocks", self._show_blocks, None),
             ("clear-history", self._confirm_clear_history, None),
         ):
             action = Gio.SimpleAction.new(name, None)
@@ -149,7 +126,9 @@ class Explorer(Adw.ApplicationWindow):
 
     def _focus_search(self, *_):
         view = self.views.get_visible_child_name()
-        if view == "timeline":
+        if view == "activity":
+            self.activity_search.grab_focus()
+        elif view == "timeline":
             self.timeline_search.grab_focus()
         else:
             self.views.set_visible_child_name("live")
@@ -269,6 +248,15 @@ class Explorer(Adw.ApplicationWindow):
             "Timeline",
             "document-open-recent-symbolic",
         )
+        self.views.add_titled_with_icon(
+            self._activity_view(), "activity", "Activity", "view-list-symbolic"
+        )
+        self.views.add_titled_with_icon(
+            self._alerts_view(),
+            "alerts",
+            "Alerts",
+            "preferences-system-notifications-symbolic",
+        )
         switcher = Adw.ViewSwitcher(
             stack=self.views, policy=Adw.ViewSwitcherPolicy.WIDE
         )
@@ -279,6 +267,7 @@ class Explorer(Adw.ApplicationWindow):
         compact = Adw.Breakpoint.new(Adw.BreakpointCondition.parse("max-width: 760sp"))
         compact.add_setter(filters, "orientation", Gtk.Orientation.VERTICAL)
         compact.add_setter(live, "spacing", 8)
+        compact.add_setter(switcher, "policy", Adw.ViewSwitcherPolicy.NARROW)
         compact.add_setter(cards, "spacing", 6)
 
         columns = table.get_columns()
@@ -439,7 +428,7 @@ class Explorer(Adw.ApplicationWindow):
     def _open_event(self, _view, position):
         row = self.filtered_events.get_item(position)
         if row and row.event.connection:
-            self._show_socket(row.event.connection)
+            self._show_socket(row.event.connection, event=row.event)
 
     def _show_events(self, events):
         rows = [EventRow(event) for event in reversed(events)]
@@ -501,30 +490,32 @@ class Explorer(Adw.ApplicationWindow):
         dropped = self.trace.dropped
         status = self.trace.status
         self.trace_label.set_label(status)
+        if status.startswith("Trace ended") and status != self.trace_status:
+            events.append(
+                Event(
+                    datetime.now().astimezone(),
+                    "Trace ended",
+                    detail=status,
+                    source="Kernel trace",
+                )
+            )
+        if dropped > self.trace_dropped:
+            events.append(
+                Event(
+                    datetime.now().astimezone(),
+                    "Trace event loss",
+                    detail=f"{dropped - self.trace_dropped:,} events dropped by the app",
+                    source="Kernel trace",
+                )
+            )
+        self._record(events)
+        self._refresh_activity_status()
         if self.session and self.session.active:
-            events = [
+            current = [
                 event for event in events if event.time >= self.session_started_at
             ]
-            if status.startswith("Trace ended") and status != self.trace_status:
-                events.append(
-                    Event(
-                        datetime.now().astimezone(),
-                        "Trace ended",
-                        detail=status,
-                        source="Kernel trace",
-                    )
-                )
-            if dropped > self.trace_dropped:
-                events.append(
-                    Event(
-                        datetime.now().astimezone(),
-                        "Trace event loss",
-                        detail=f"{dropped - self.trace_dropped:,} events dropped by the app",
-                        source="Kernel trace",
-                    )
-                )
-            if events:
-                self.session.add(*events)
+            if current:
+                self.session.add(*current)
                 self._update_session()
         self.trace_status = status
         self.trace_dropped = dropped
@@ -774,6 +765,11 @@ class Explorer(Adw.ApplicationWindow):
 
     def _toggle_pause(self, *_):
         self.paused = not self.paused
+        self.monitor.gap(
+            "Snapshot monitoring paused"
+            if self.paused
+            else "Snapshot monitoring resumed"
+        )
         self.previous_diagnostics = None
         self.rate_baseline = None
         if self.session and self.session.active:
@@ -793,6 +789,9 @@ class Explorer(Adw.ApplicationWindow):
 
     def _tick(self):
         self._drain_trace()
+        self._read_firewall()
+        self._read_host()
+        self._update_quiet()
         self._refresh()
         return GLib.SOURCE_CONTINUE
 
@@ -820,6 +819,16 @@ class Explorer(Adw.ApplicationWindow):
         if self.closed or self.discard_pending:
             return GLib.SOURCE_REMOVE
         self.error = snapshot is None
+        if snapshot is None:
+            self.monitor.gap("Snapshot read failed")
+        else:
+            last = self.monitor.session.last_snapshot_at
+            if (
+                last
+                and (snapshot.captured_at - last).total_seconds() > REFRESH_INTERVAL * 3
+            ):
+                self.monitor.gap("Snapshot sampling was interrupted")
+            self._record(self.monitor.snapshot(snapshot))
         if self.session and self.session.active:
             if snapshot is None:
                 self.session.gap(datetime.now().astimezone(), "Snapshot read failed")
@@ -863,6 +872,13 @@ class Explorer(Adw.ApplicationWindow):
         return GLib.SOURCE_REMOVE
 
     def _close(self, *_):
+        if (
+            not self.demo
+            and self.settings["background"]
+            and not self.get_application().quitting
+        ):
+            self.set_visible(False)
+            return True
         if self.session and self.session.active:
             self._drain_trace()
             self._finish_session()
@@ -876,7 +892,7 @@ class Explorer(Adw.ApplicationWindow):
             return
         self._show_socket(row.connection, live=True)
 
-    def _show_socket(self, connection, live=False):
+    def _show_socket(self, connection, live=False, event=None, alert=None):
         details = Adw.Dialog(title="Socket Details", content_width=500)
         page = Adw.PreferencesPage()
         process = Adw.PreferencesGroup(title="Process")
@@ -889,6 +905,7 @@ class Explorer(Adw.ApplicationWindow):
                 str(connection.pid) if connection.pid is not None else None,
             ),
             (process, "Executable", connection.executable),
+            (process, "Parent process", connection.parent),
             (fields, "Protocol", f"{connection.protocol} · {connection.family}"),
             (
                 fields,
@@ -915,10 +932,15 @@ class Explorer(Adw.ApplicationWindow):
             )
         page.add(process)
         page.add(fields)
-        if live:
+        if live or (
+            self.snapshot
+            and connection.inode
+            and connection in self.snapshot.connections
+        ):
             self._add_tcp_details(page, connection)
-        if live and connection.is_listener and connection.local:
+        if connection.is_listener and connection.local:
             self._add_listener_details(page, connection)
+        self._security_context(page, connection, event, alert)
         toolbar = Adw.ToolbarView()
         toolbar.add_top_bar(Adw.HeaderBar())
         toolbar.set_content(page)
@@ -1045,9 +1067,19 @@ class SocketForge(Adw.Application):
         super().__init__(application_id=APP_ID, flags=flags)
         self.demo = demo
         self.trace = trace
+        self.quitting = False
 
     def do_startup(self):
         Adw.Application.do_startup(self)
+        for name, signature, callback in (
+            ("open-alert", "s", self._open_notification),
+            ("quit", None, self._quit_monitor),
+        ):
+            action = Gio.SimpleAction.new(
+                name, GLib.VariantType.new(signature) if signature else None
+            )
+            action.connect("activate", callback)
+            self.add_action(action)
         display = Gdk.Display.get_default()
         assets = Path(__file__).with_name("assets")
         Gtk.IconTheme.get_for_display(display).add_search_path(str(assets))
@@ -1058,8 +1090,18 @@ class SocketForge(Adw.Application):
             display, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
         )
 
+    def _open_notification(self, _action, target):
+        self.activate()
+        self.get_windows()[0].open_alert_id(target.get_string())
+
+    def _quit_monitor(self, *_):
+        self.quitting = True
+        for window in self.get_windows():
+            window.close()
+        self.quit()
+
     def do_activate(self):
-        window = self.get_active_window()
+        window = next(iter(self.get_windows()), None)
         if window is None:
             window = Explorer(self, self.demo, self.trace)
         window.present()

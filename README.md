@@ -46,3 +46,37 @@ Only the Fedora collector runs with elevated privileges. The command filters tra
 ```sh
 python3 -m unittest discover -s tests -v
 ```
+
+## Activity and alerts
+
+**Activity** records observations while SocketForge runs, including its first snapshot, later socket changes, trace events, and logged hits from SocketForge firewall rules. Filter by Outbound, Inbound, Listening, Blocked, or Unknown. The button next to the filter groups the results by app. TCP connect and accept events supply direction. Snapshot-only sockets usually have unknown direction. The Activity view retains up to 2,000 rows and Alerts retains up to 300 entries for the current run. Use Timeline with **Save locally** to keep an investigation.
+
+**Alerts** shows new non-loopback TCP listeners observed after the baseline, first accepts for watched services, new observed destinations for watched apps, and the first logged hit on a SocketForge rule. Desktop notifications start off. You can enable them, pause them for one hour, or mute a rule for a specific app from its alert details. These controls affect banners. App watches expire after 15 minutes. **Keep monitoring after closing** keeps the app running while signed in. Use **Quit SocketForge** from the menu to stop it.
+
+In a socket’s details, **Inspect IP** classifies local and special-use addresses offline. **Look Up IP** sends the selected public address to its RDAP registry, RIPEstat, and your DNS resolver. It displays registration, announced prefix and ASN, reverse DNS, and an estimated country when available. Results are cached in memory. A prefix links to retained observations grouped by app. An address can belong to shared infrastructure, and the estimated location can vary from the server handling a connection.
+
+## Temporary firewall blocks
+
+On a non-loopback listener, open the Firewall section and choose an active zone. On an observed TCP or UDP outbound event, choose a host-output policy. Confirm the exact address, port, protocol, and zone or policy shown. firewalld applies a 15-minute runtime rule and can ask for administrator authorization. The rule matches traffic from any app within its scope. Established connections can remain active. The **Temporary Firewall Blocks** menu and the confirmation toast provide Undo during the current run.
+
+The Blocked filter shows rate-limited kernel journal records for SocketForge rules. Hit counts reflect entries that reached the journal. Other firewall denies are outside this view. Existing global logging settings are left alone. Journal read access is required to show hits.
+
+Outbound blocking requires a firewalld policy with `HOST` as ingress. An administrator can install the empty example below if no suitable policy exists. Reloading firewalld replaces runtime configuration, including temporary rules.
+
+```sh
+sudo firewall-cmd --permanent --new-policy-from-file=data/socketforge-output.xml
+sudo firewall-cmd --reload
+```
+
+## Optional host collectors
+
+For broader host coverage, an administrator can install Fedora’s `libbpf-tools` and `conntrack-tools` packages, then opt in to either systemd collector from this repository:
+
+```sh
+sudo dnf install libbpf-tools conntrack-tools
+sudo install -m 0644 data/socketforge-tcp.service data/socketforge-udp.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now socketforge-tcp.service socketforge-udp.service
+```
+
+Disable them with `sudo systemctl disable --now socketforge-tcp.service socketforge-udp.service`. These services record connection metadata in the system journal, which can include other users’ traffic. The GNOME app reads the journal as your user and reports collector status. TCP tracing reports supported connect, accept and close events. UDP conntrack reports tracked flows in the host namespace and SocketForge groups them by endpoint. It can label direction when one endpoint matches a host address. UDP process ownership and byte counts may be unavailable. VPNs, NAT, network namespaces, journal limits, and collector gaps affect visibility. Sampled TCP byte counts remain available through the existing socket diagnostics.

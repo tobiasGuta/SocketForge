@@ -91,3 +91,45 @@ class TraceInput:
             except Empty:
                 break
         return events
+
+
+def parse_udp(line, local_addresses):
+    """Read the original tuple from a conntrack UDP NEW event."""
+    if "[NEW]" not in line or not re.search(r"\budp\s", line):
+        return None
+    fields = re.findall(r"\b(src|dst|sport|dport)=(\S+)", line)
+    try:
+        original = dict(fields[:4])
+        source, destination = (
+            ipaddress.ip_address(original[key]) for key in ("src", "dst")
+        )
+        source_port, destination_port = (
+            int(original[key]) for key in ("sport", "dport")
+        )
+    except (ValueError, KeyError):
+        return None
+    if source.version != destination.version or not (
+        0 <= source_port <= 65535 and 0 <= destination_port <= 65535
+    ):
+        return None
+    source_local = str(source) in local_addresses or source.is_loopback
+    destination_local = str(destination) in local_addresses or destination.is_loopback
+    if not (source_local or destination_local):
+        return None
+    origin = Endpoint(str(source), source_port)
+    peer = Endpoint(str(destination), destination_port)
+    kind = "UDP flow observed"
+    if source_local != destination_local:
+        kind = "UDP outbound flow" if source_local else "UDP inbound flow"
+    if not source_local:
+        origin, peer = peer, origin
+    row = Connection(
+        None, None, None, "UDP", f"IPv{source.version}", origin, peer, None
+    )
+    return Event(
+        datetime.now().astimezone(),
+        kind,
+        row,
+        "Direction based on the original conntrack tuple",
+        "Host conntrack",
+    )

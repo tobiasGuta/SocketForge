@@ -8,3 +8,4 @@ Type=Application
 Categories=Network;Monitor;
 Keywords=Network;Socket;Connections;TCP;UDP;Ports;Process;
 StartupNotify=true
+X-GNOME-UsesNotifications=true

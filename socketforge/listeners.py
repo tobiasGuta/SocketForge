@@ -22,7 +22,7 @@ def _query(*command):
     return result.stdout.strip()
 
 
-def _systemd_unit(connection):
+def systemd_unit(connection):
     if connection.pid is None or connection.started is None:
         return None
     for bus in ("--user", "--system"):
@@ -115,7 +115,7 @@ def inspect_listener(connection):
         bind = "Specific local address"
     return (
         ("Bind scope", bind),
-        ("Systemd unit", _systemd_unit(connection)),
+        ("Systemd unit", systemd_unit(connection)),
         ("Podman port mapping", _podman_mappings(host, connection.local.port)),
         ("firewalld interface zones", _firewall_zones(host)),
     )

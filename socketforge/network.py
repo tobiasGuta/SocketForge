@@ -34,6 +34,7 @@ class Connection:
     state: str | None
     started: float | None = None
     inode: int | None = None
+    parent: str | None = None
 
     @property
     def process_label(self):
@@ -90,14 +91,23 @@ def _process_details(pid, collection_started):
         with process.oneshot():
             started = process.create_time()
             if started > collection_started:
-                return None, None, None
+                return None, None, None, None
             name = process.name()
             try:
-                return name, process.exe() or None, started
+                parent_process = process.parent()
+                parent = (
+                    f"{parent_process.name()} · PID {parent_process.pid}"
+                    if parent_process
+                    else None
+                )
             except psutil.Error:
-                return name, None, started
+                parent = None
+            try:
+                return name, process.exe() or None, started, parent
+            except psutil.Error:
+                return name, None, started, parent
     except psutil.Error:
-        return None, None, None
+        return None, None, None, None
 
 
 def _socket_inode(pid, fd):
@@ -130,7 +140,9 @@ def collect():
     for sock in sockets:
         if sock.pid is not None and sock.pid not in processes:
             processes[sock.pid] = _process_details(sock.pid, collection_started)
-        name, executable, started = processes.get(sock.pid, (None, None, None))
+        name, executable, started, parent = processes.get(
+            sock.pid, (None, None, None, None)
+        )
         # psutil 8 uses enum values. Earlier versions expose state as a string.
         state = getattr(sock.status, "value", sock.status)
         connections.append(
@@ -144,6 +156,7 @@ def collect():
                 remote=Endpoint(*sock.raddr) if sock.raddr else None,
                 state=None if state == "NONE" else state,
                 started=started,
+                parent=_display_text(parent),
                 inode=_socket_inode(sock.pid, sock.fd) if started is not None else None,
             )
         )

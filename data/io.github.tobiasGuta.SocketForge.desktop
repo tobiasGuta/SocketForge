@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=SocketForge
+Comment=Inspect local network connections and listening ports
+Exec=socketforge
+Icon=io.github.tobiasGuta.SocketForge
+Terminal=false
+Type=Application
+Categories=Network;Monitor;
+Keywords=Network;Socket;Connections;TCP;UDP;Ports;Process;
+StartupNotify=true

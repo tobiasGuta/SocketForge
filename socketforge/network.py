@@ -38,7 +38,25 @@ class Connection:
 
     @property
     def process_label(self):
-        return self.process or "Unknown process"
+        if self.process:
+            return self.process
+        return f"PID {self.pid}" if self.pid is not None else "Unknown process"
+
+    def owner_explanation(self, source=None):
+        if self.process:
+            return None
+        if self.pid is not None:
+            return "The socket has a PID. The process name was unavailable when it was read."
+        if source in ("Firewall", "Host conntrack"):
+            return "This network record contains endpoints and protocol without a process ID."
+        if self.state == "TIME_WAIT":
+            return "Linux can keep this TCP entry after the connection closes and the process releases the socket."
+        if source in ("Kernel trace", "Host TCP trace"):
+            return "The TCP trace did not report a process for this event."
+        return (
+            "Linux reported the socket without a readable owning PID. Another user, "
+            "an exited process, or a kernel-managed socket can account for this."
+        )
 
     @property
     def is_listener(self):

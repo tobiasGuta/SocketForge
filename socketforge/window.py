@@ -20,6 +20,7 @@ from .listeners import inspect_listener
 from .network import collect
 from .security_ui import SecurityViews
 from .timeline import Event, Session, clear_history, load_recent, save
+from .tray import Tray
 from .widgets import EventRow, box, endpoint_text, label
 
 REFRESH_INTERVAL = 2
@@ -784,6 +785,9 @@ class Explorer(SecurityViews, Adw.ApplicationWindow):
             self.discard_pending = True
         self._set_pause_button()
         self._update_status()
+        tray = self.get_application().tray
+        if tray:
+            tray.update()
         if not self.paused:
             self._refresh()
 
@@ -874,7 +878,7 @@ class Explorer(SecurityViews, Adw.ApplicationWindow):
     def _close(self, *_):
         if (
             not self.demo
-            and self.settings["background"]
+            and (self.settings["background"] or self.get_application().tray_available)
             and not self.get_application().quitting
         ):
             self.set_visible(False)
@@ -896,6 +900,8 @@ class Explorer(SecurityViews, Adw.ApplicationWindow):
         details = Adw.Dialog(title="Socket Details", content_width=500)
         page = Adw.PreferencesPage()
         process = Adw.PreferencesGroup(title="Process")
+        if explanation := connection.owner_explanation(event.source if event else None):
+            process.set_description(explanation)
         fields = Adw.PreferencesGroup(title="Socket")
         for group, name, value in (
             (process, "Name", connection.process_label),
@@ -1068,6 +1074,11 @@ class SocketForge(Adw.Application):
         self.demo = demo
         self.trace = trace
         self.quitting = False
+        self.tray = None
+
+    @property
+    def tray_available(self):
+        return self.tray is not None and self.tray.registered
 
     def do_startup(self):
         Adw.Application.do_startup(self)
@@ -1080,6 +1091,10 @@ class SocketForge(Adw.Application):
             )
             action.connect("activate", callback)
             self.add_action(action)
+        if not self.demo and not self.get_flags() & Gio.ApplicationFlags.NON_UNIQUE:
+            bus = self.get_dbus_connection()
+            if bus is not None:
+                self.tray = Tray(self, bus)
         display = Gdk.Display.get_default()
         assets = Path(__file__).with_name("assets")
         Gtk.IconTheme.get_for_display(display).add_search_path(str(assets))
@@ -1089,6 +1104,12 @@ class SocketForge(Adw.Application):
         Gtk.StyleContext.add_provider_for_display(
             display, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
         )
+
+    def do_shutdown(self):
+        if self.tray:
+            self.tray.close()
+            self.tray = None
+        Adw.Application.do_shutdown(self)
 
     def _open_notification(self, _action, target):
         self.activate()

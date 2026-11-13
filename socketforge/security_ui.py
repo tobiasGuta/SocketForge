@@ -296,8 +296,8 @@ class SecurityViews:
         )
         self._update_quiet()
         background = Adw.SwitchRow(
-            title="Keep monitoring after closing",
-            subtitle="Continue while you are signed in",
+            title="Keep monitoring without a tray icon",
+            subtitle="Continue after closing even when the desktop has no tray",
         )
         background.set_active(self.settings["background"])
         background.set_sensitive(not self.demo)

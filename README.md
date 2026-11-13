@@ -80,3 +80,11 @@ sudo systemctl enable --now socketforge-tcp.service socketforge-udp.service
 ```
 
 Disable them with `sudo systemctl disable --now socketforge-tcp.service socketforge-udp.service`. These services record connection metadata in the system journal, which can include other users’ traffic. The GNOME app reads the journal as your user and reports collector status. TCP tracing reports supported connect, accept and close events. UDP conntrack reports tracked flows in the host namespace and SocketForge groups them by endpoint. It can label direction when one endpoint matches a host address. UDP process ownership and byte counts may be unavailable. VPNs, NAT, network namespaces, journal limits, and collector gaps affect visibility. Sampled TCP byte counts remain available through the existing socket diagnostics.
+
+## GNOME top-bar tray
+
+The regular launcher publishes a SocketForge icon when the desktop provides a StatusNotifier tray. On Fedora GNOME this is supplied by the **AppIndicator and KStatusNotifierItem Support** extension (`gnome-shell-extension-appindicator`). The tray menu opens SocketForge or Alerts, pauses or resumes socket snapshots, and quits the app. Closing the window while the tray is available keeps monitoring in the background. Choose **Quit SocketForge** from the tray or the app menu to stop it.
+
+## Unknown processes
+
+A socket can be visible even when SocketForge cannot read its owner. Details distinguish a known PID with an unavailable name, a TCP `TIME_WAIT` entry, and a firewall or conntrack record that carries no PID. Linux permissions can hide socket owners from other users or system services, and short-lived processes can exit before the next snapshot. An opt-in host TCP trace can identify the process at connect or accept time for future events it captures.

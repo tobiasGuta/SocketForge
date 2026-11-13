@@ -71,6 +71,16 @@ class SessionTests(unittest.TestCase):
         session.observe(Snapshot((replace(row, state="ESTABLISHED"),), self.now))
         self.assertEqual(session.events[-1].detail, "SYN_SENT → ESTABLISHED")
 
+    def test_owner_explanation_keeps_known_pid_and_distinguishes_sources(self):
+        unnamed = replace(self.listener, process=None)
+        self.assertEqual(unnamed.process_label, "PID 123")
+        self.assertIn("name was unavailable", unnamed.owner_explanation())
+        unknown = replace(unnamed, pid=None, state="TIME_WAIT")
+        self.assertEqual(unknown.process_label, "Unknown process")
+        self.assertIn("after the connection closes", unknown.owner_explanation())
+        self.assertIn("without a process ID", unknown.owner_explanation("Firewall"))
+        self.assertIsNone(self.listener.owner_explanation())
+
 
 class DiagnosticsTests(unittest.TestCase):
     def test_live_tcp_info_follows_the_socket(self):

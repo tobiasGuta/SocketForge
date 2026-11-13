@@ -1,33 +1,48 @@
 # SocketForge
 
-SocketForge is a native GNOME app for inspecting local TCP and UDP sockets on Fedora. The v0.1 Network Explorer shows which processes own visible sockets, where they communicate, and which TCP sockets are listening.
+SocketForge is a native GNOME app for investigating local network activity on Fedora. It shows current TCP and UDP sockets, records what changes during an investigation, and explains how local services are listening.
 
-![SocketForge Network Explorer in GNOME dark mode, showing fictional sockets](docs/demo.png)
+![SocketForge in GNOME dark mode showing fictional sockets](docs/demo.png)
 
 ## Run on Fedora
 
-From the repository directory, install the runtime dependencies and launch the app.
+From the repository directory:
 
 ```sh
 sudo dnf install gtk4 libadwaita python3-gobject python3-psutil
-/usr/bin/python3 -m socketforge
+make install
+socketforge
 ```
 
-SocketForge uses GTK4 and Libadwaita 1.8 or newer. Run `/usr/bin/python3 -m socketforge --demo` to explore the interface with fictional data without reading host sockets.
+SocketForge appears in the GNOME app grid. The user install lives under `~/.local` and `make uninstall` removes the app and launcher. SocketForge requires GTK4 and Libadwaita 1.8 or newer. Use `python3 -m socketforge` to run from source, or add `--demo` to preview fictional sockets.
 
-To add SocketForge to the GNOME app grid, run `make install` from the repository directory. This installs a launcher and icon under `~/.local`. Run `make uninstall` to remove them along with the installed app files.
+## Investigate a network change
 
-## Explore sockets
+1. Open **Timeline** and select **Start Session**. Wait for **Baseline captured**.
+2. Start the application or service you want to observe. In **Listening Ports**, select a TCP listener to see its bind scope, systemd unit, matching Podman mapping for the current user, and firewalld interface zones where available.
+3. Reproduce the issue or stop the service. Return to **Timeline** to search by process, address, or event type and inspect a socket after it disappears.
+4. Select **Stop Session**. Sessions stay in memory by default. Select **Save locally** before recording to store the completed session on disk. Find it under **Saved Sessions** in the menu.
 
-- Search by process name, PID, address, port, state, or executable path. Click a column header to sort.
-- Use **TCP listeners** to inspect sockets in the `LISTEN` state. **Bound UDP** shows UDP sockets with a local address and no peer.
-- Open a row to see its address family, executable path, and full endpoints. The details view also exposes fields hidden from the table at narrow widths.
-- Press **Ctrl+P** to pause or resume the two-second refresh. **Ctrl+R** takes a fresh snapshot even while paused. **Ctrl+F** focuses search.
+A session retains its most recent 2,000 events. Saving or opening history prunes sessions older than seven days and the database holds up to 20 sessions. **Clear Saved Sessions** deletes stored sessions. The history can include local and remote addresses, process names, and executable paths.
 
-SocketForge reads snapshots with psutil and runs as your regular user. Linux permissions and the current network namespace limit which sockets and process details are visible. Short-lived connections can occur between snapshots. A wildcard bind such as `0.0.0.0:22` means the service listens on all local IPv4 interfaces. Firewall and routing rules determine whether another machine can reach it.
+Snapshot events show when SocketForge first or last observed a socket. The app marks interruptions and establishes a fresh baseline. Sockets that come and go between two-second refreshes can be missed. Linux permissions and network namespaces limit which sockets and owners are visible. Listener context describes local configuration. Reachability also depends on rules, routing and the originating network.
 
-## Roadmap
+Use **Ctrl+F** to focus search, **Ctrl+P** to pause or resume snapshots, and **Ctrl+R** to take a snapshot immediately. In **Live**, click a column header to sort. Open a TCP row for sampled RTT, retransmissions, byte totals, and rates when consecutive samples are available. The send rate measures acknowledged TCP data and the receive rate measures TCP data received. UDP and interface-wide traffic are outside these counters.
 
-- **0.2 · Process Inspector** — group sockets by process and expand process details.
-- **0.3 · Security Monitoring** — detect new endpoints and listening sockets, with optional history.
-- **0.4 · Network Analytics** — explore per-process bandwidth and event tracing on supported systems.
+## Optional TCP event tracing
+
+Fedora's precompiled `bpf-tcptracer` can report short-lived established TCP connections, including connect, accept, and close events. Install [`libbpf-tools`](https://packages.fedoraproject.org/pkgs/bcc/libbpf-tools/) if needed, then run the following in a terminal:
+
+```sh
+sudo -v
+sudo -n /usr/bin/stdbuf -oL /usr/bin/bpf-tcptracer -u "$(id -u)" 2>&1 |
+  socketforge --trace-stdin
+```
+
+Only the Fedora collector runs with elevated privileges. The command filters trace events to your UID, which can include sockets in other network namespaces. Start a Timeline session in the window opened by this command. Trace rows are labeled **Kernel trace** and timestamped when SocketForge reads them. They can appear alongside sampled observations of the same connection. The Timeline shows collector status and reports loss warnings from BCC or an overflowing input queue. Stop the pipeline with **Ctrl+C** in the terminal when finished. Kernel support and local security policy can prevent the collector from attaching. The regular launcher continues to provide snapshot monitoring.
+
+## Test
+
+```sh
+python3 -m unittest discover -s tests -v
+```

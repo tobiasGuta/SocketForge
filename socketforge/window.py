@@ -1,6 +1,9 @@
 """GTK4 and Libadwaita interface for the socket explorer."""
 
 import logging
+import sqlite3
+from datetime import datetime
+from itertools import islice
 from pathlib import Path
 from threading import Thread
 
@@ -12,7 +15,10 @@ from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk, Pango
 
 from . import APP_ID, VERSION
 from .demo import collect_demo
+from .diagnostics import rates
+from .listeners import inspect_listener
 from .network import collect
+from .timeline import Event, Session, clear_history, load_recent, save
 
 REFRESH_INTERVAL = 2
 SCOPE_NAMES = ("All sockets", "TCP listeners", "Bound UDP")
@@ -48,12 +54,29 @@ class SocketRow(GObject.Object):
         self.search_text = connection.search_text
 
 
+class EventRow(GObject.Object):
+    def __init__(self, event):
+        super().__init__()
+        self.event = event
+        connection = event.connection.search_text if event.connection else ""
+        self.search_text = (
+            f"{event.kind} {event.detail} {event.source} {connection}".casefold()
+        )
+
+
 class Explorer(Adw.ApplicationWindow):
-    def __init__(self, application, demo):
+    def __init__(self, application, demo, trace=None):
         super().__init__(application=application, title="SocketForge")
         self.set_default_size(1120, 740)
         self.set_size_request(460, 440)
         self.demo = demo
+        self.trace = trace
+        self.trace_dropped = 0
+        self.trace_status = None
+        self.session = None
+        self.rendered_events = 0
+        self.previous_diagnostics = None
+        self.rate_baseline = None
         self.collect = collect_demo if demo else collect
         self.snapshot = None
         self.error = False
@@ -85,6 +108,9 @@ class Explorer(Adw.ApplicationWindow):
         )
 
         menu = Gio.Menu()
+        if not self.demo:
+            menu.append("Saved Sessions", "win.history")
+            menu.append("Clear Saved Sessions", "win.clear-history")
         menu.append("Keyboard Shortcuts", "win.shortcuts")
         menu.append("About SocketForge", "win.about")
         header.pack_end(
@@ -108,9 +134,11 @@ class Explorer(Adw.ApplicationWindow):
         for name, handler, shortcut in (
             ("refresh", lambda *_: self._refresh(manual=True), "<Control>r"),
             ("pause", self._toggle_pause, "<Control>p"),
-            ("search", lambda *_: self.search.grab_focus(), "<Control>f"),
+            ("search", self._focus_search, "<Control>f"),
             ("shortcuts", self._show_shortcuts, "<Control>question"),
             ("about", self._show_about, None),
+            ("history", self._show_history, None),
+            ("clear-history", self._confirm_clear_history, None),
         ):
             action = Gio.SimpleAction.new(name, None)
             action.connect("activate", handler)
@@ -118,6 +146,14 @@ class Explorer(Adw.ApplicationWindow):
             if shortcut:
                 self.get_application().set_accels_for_action(f"win.{name}", [shortcut])
         return header
+
+    def _focus_search(self, *_):
+        view = self.views.get_visible_child_name()
+        if view == "timeline":
+            self.timeline_search.grab_focus()
+        else:
+            self.views.set_visible_child_name("live")
+            self.search.grab_focus()
 
     def _content(self):
         heading = label("Network activity", "title-1")
@@ -166,7 +202,6 @@ class Explorer(Adw.ApplicationWindow):
         self.search = Gtk.SearchEntry(
             placeholder_text="Search process, PID, or address…", hexpand=True
         )
-        self.search.set_key_capture_widget(self)
         self.search.connect("search-changed", self._filter_changed)
         self.scope = self._dropdown(SCOPE_NAMES, "Socket type")
         self.protocol = self._dropdown(PROTOCOL_NAMES, "Protocol")
@@ -210,7 +245,7 @@ class Explorer(Adw.ApplicationWindow):
         self.permissions.set_popover(popover)
         footer = box(self.footer, self.permissions, spacing=8)
 
-        content = box(
+        live = box(
             box(heading, self.status_pill, spacing=12),
             cards,
             section_header,
@@ -219,11 +254,31 @@ class Explorer(Adw.ApplicationWindow):
             footer,
             vertical=True,
             spacing=12,
-            css="explorer-content",
+        )
+        self.views = Adw.ViewStack(vexpand=True)
+        self.views.add_titled_with_icon(live, "live", "Live", "network-wired-symbolic")
+        self.views.add_titled_with_icon(
+            self._listeners_view(),
+            "listeners",
+            "Listening Ports",
+            "network-server-symbolic",
+        )
+        self.views.add_titled_with_icon(
+            self._timeline_view(),
+            "timeline",
+            "Timeline",
+            "document-open-recent-symbolic",
+        )
+        switcher = Adw.ViewSwitcher(
+            stack=self.views, policy=Adw.ViewSwitcherPolicy.WIDE
+        )
+        switcher.set_halign(Gtk.Align.CENTER)
+        content = box(
+            switcher, self.views, vertical=True, spacing=12, css="explorer-content"
         )
         compact = Adw.Breakpoint.new(Adw.BreakpointCondition.parse("max-width: 760sp"))
         compact.add_setter(filters, "orientation", Gtk.Orientation.VERTICAL)
-        compact.add_setter(content, "spacing", 8)
+        compact.add_setter(live, "spacing", 8)
         compact.add_setter(cards, "spacing", 6)
 
         columns = table.get_columns()
@@ -235,6 +290,307 @@ class Explorer(Adw.ApplicationWindow):
         self._update_table_status()
         self._update_status()
         return content
+
+    def _listeners_view(self):
+        heading = label("Listening ports", "title-1")
+        subtitle = label("TCP listeners in the current network namespace", "dim-label")
+        subtitle.set_wrap(True)
+        self.listeners = Gtk.FilterListModel.new(
+            self.store, Gtk.CustomFilter.new(lambda row, *_: row.connection.is_listener)
+        )
+        view = self._list_view(
+            self.listeners, self._listener_item, self._inspect_listener_row
+        )
+        self.listener_empty = Adw.StatusPage(
+            icon_name="network-server-symbolic", title="No visible TCP listeners"
+        )
+        self.listener_empty.add_css_class("compact")
+        self.listener_stack = Gtk.Stack(vexpand=True)
+        self.listener_stack.add_named(view, "list")
+        self.listener_stack.add_named(self.listener_empty, "empty")
+        self.listeners.connect("items-changed", self._update_listeners)
+        self._update_listeners()
+        return box(heading, subtitle, self.listener_stack, vertical=True, spacing=10)
+
+    def _update_listeners(self, *_):
+        self.listener_stack.set_visible_child_name(
+            "list" if self.listeners.get_n_items() else "empty"
+        )
+
+    def _listener_item(self, row):
+        connection = row.connection
+        pid = f" · PID {connection.pid}" if connection.pid is not None else ""
+        return (
+            str(connection.local),
+            f"{connection.process_label}{pid} · {connection.family}",
+            True,
+        )
+
+    def _inspect_listener_row(self, _view, position):
+        row = self.listeners.get_item(position)
+        if row:
+            self._show_socket(row.connection, live=True)
+
+    def _list_view(self, model, describe, activate):
+        def setup(_factory, item):
+            title = label("", "heading")
+            subtitle = label("", "dim-label", "caption")
+            for text in (title, subtitle):
+                text.set_ellipsize(Pango.EllipsizeMode.END)
+            item.set_child(
+                box(title, subtitle, vertical=True, spacing=3, css="event-row")
+            )
+
+        def bind(_factory, item):
+            title, subtitle, clickable = describe(item.get_item())
+            row = item.get_child()
+            row.get_first_child().set_label(title)
+            row.get_last_child().set_label(subtitle)
+            row.set_tooltip_text(subtitle or None)
+            item.set_activatable(clickable)
+
+        factory = Gtk.SignalListItemFactory()
+        factory.connect("setup", setup)
+        factory.connect("bind", bind)
+        view = Gtk.ListView(
+            model=Gtk.NoSelection.new(model),
+            factory=factory,
+            single_click_activate=True,
+            show_separators=True,
+        )
+        view.connect("activate", activate)
+        scroll = Gtk.ScrolledWindow(vexpand=True, child=view)
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroll.add_css_class("socket-table")
+        return scroll
+
+    def _timeline_view(self):
+        title = label("Investigation timeline", "title-1")
+        title.set_wrap(True)
+        self.session_status = label(
+            "Start a session to record socket changes.", "dim-label"
+        )
+        self.session_status.set_wrap(True)
+        self.trace_label = label("", "caption", "dim-label")
+        self.trace_label.set_wrap(True)
+        self.trace_label.set_visible(self.trace is not None)
+        self.session_button = Gtk.Button(label="Start Session")
+        self.session_button.add_css_class("suggested-action")
+        self.session_button.connect("clicked", self._toggle_session)
+        self.persist = Gtk.CheckButton(label="Save locally")
+        self.persist.set_tooltip_text("Keep up to 20 completed sessions for seven days")
+        self.persist.set_visible(not self.demo)
+        self.event_store = Gio.ListStore.new(EventRow)
+        self.timeline_search = Gtk.SearchEntry(
+            placeholder_text="Search events, processes, or addresses…", hexpand=True
+        )
+        self.timeline_search.connect("search-changed", self._timeline_filter_changed)
+        self.event_filter = Gtk.CustomFilter.new(self._matches_event)
+        self.filtered_events = Gtk.FilterListModel.new(
+            self.event_store, self.event_filter
+        )
+        events = self._list_view(
+            self.filtered_events, self._describe_event, self._open_event
+        )
+        empty = Adw.StatusPage(
+            icon_name="document-open-recent-symbolic", title="No events to show"
+        )
+        empty.add_css_class("compact")
+        self.event_stack = Gtk.Stack(vexpand=True)
+        self.event_stack.add_named(events, "events")
+        self.event_stack.add_named(empty, "empty")
+        self.event_stack.set_visible_child_name("empty")
+        self.filtered_events.connect("items-changed", self._update_event_stack)
+        return box(
+            title,
+            self.session_status,
+            self.trace_label,
+            box(self.session_button, self.persist, spacing=12),
+            self.timeline_search,
+            self.event_stack,
+            vertical=True,
+            spacing=10,
+        )
+
+    def _matches_event(self, row, *_):
+        terms = self.timeline_search.get_text().casefold().split()
+        return all(term in row.search_text for term in terms)
+
+    def _timeline_filter_changed(self, *_):
+        self.event_filter.changed(Gtk.FilterChange.DIFFERENT)
+
+    def _update_event_stack(self, *_):
+        self.event_stack.set_visible_child_name(
+            "events" if self.filtered_events.get_n_items() else "empty"
+        )
+
+    def _describe_event(self, row):
+        event = row.event
+        pieces = [f"{event.time:%H:%M:%S}", event.source]
+        if event.connection:
+            connection = event.connection
+            pieces.extend((connection.process_label, endpoint_text(connection.local)))
+            if connection.remote:
+                pieces.append(str(connection.remote))
+        if event.detail:
+            pieces.append(event.detail)
+        return event.kind, " · ".join(pieces), event.connection is not None
+
+    def _open_event(self, _view, position):
+        row = self.filtered_events.get_item(position)
+        if row and row.event.connection:
+            self._show_socket(row.event.connection)
+
+    def _show_events(self, events):
+        rows = [EventRow(event) for event in reversed(events)]
+        self.event_store.splice(0, self.event_store.get_n_items(), rows)
+
+    def _toggle_session(self, *_):
+        if self.session and self.session.active:
+            self._drain_trace()
+            self._finish_session()
+            return
+        self._drain_trace()
+        self.session = Session(persist=self.persist.get_active() and not self.demo)
+        self.session_started_at = datetime.now().astimezone()
+        self._show_events([])
+        self.rendered_events = 0
+        self.session_button.set_label("Stop Session")
+        self.session_button.remove_css_class("suggested-action")
+        self.persist.set_sensitive(False)
+        self.session_status.set_label("Waiting for the baseline snapshot…")
+        self._refresh(manual=True)
+
+    def _finish_session(self):
+        self.session.active = False
+        self.session_button.set_label("Start Session")
+        self.session_button.add_css_class("suggested-action")
+        self.persist.set_sensitive(True)
+        count = len(self.session.events)
+        self.session_status.set_label(f"Session ended · {count:,} retained events")
+        if self.session.persist:
+            try:
+                save(self.session)
+                self.session_status.set_label(
+                    f"Session saved locally · {count:,} retained events"
+                )
+            except (OSError, sqlite3.Error):
+                LOGGER.exception("Unable to save session")
+                self.toasts.add_toast(Adw.Toast(title="Couldn’t save session"))
+
+    def _update_session(self):
+        new_count = self.session.event_count - self.rendered_events
+        if new_count:
+            count = min(new_count, len(self.session.events))
+            rows = [
+                EventRow(event)
+                for event in islice(reversed(self.session.events), count)
+            ]
+            self.event_store.splice(0, 0, rows)
+            excess = self.event_store.get_n_items() - len(self.session.events)
+            if excess:
+                self.event_store.splice(len(self.session.events), excess, [])
+            self.rendered_events = self.session.event_count
+        count = len(self.session.events)
+        self.session_status.set_label(f"Recording · {count:,} retained events")
+
+    def _drain_trace(self):
+        if not self.trace:
+            return
+        events = self.trace.drain()
+        dropped = self.trace.dropped
+        status = self.trace.status
+        self.trace_label.set_label(status)
+        if self.session and self.session.active:
+            events = [
+                event for event in events if event.time >= self.session_started_at
+            ]
+            if status.startswith("Trace ended") and status != self.trace_status:
+                events.append(
+                    Event(
+                        datetime.now().astimezone(),
+                        "Trace ended",
+                        detail=status,
+                        source="Kernel trace",
+                    )
+                )
+            if dropped > self.trace_dropped:
+                events.append(
+                    Event(
+                        datetime.now().astimezone(),
+                        "Trace event loss",
+                        detail=f"{dropped - self.trace_dropped:,} events dropped by the app",
+                        source="Kernel trace",
+                    )
+                )
+            if events:
+                self.session.add(*events)
+                self._update_session()
+        self.trace_status = status
+        self.trace_dropped = dropped
+
+    def _show_history(self, *_):
+        if self.session and self.session.active:
+            self.toasts.add_toast(
+                Adw.Toast(title="Stop the active session to open a saved session")
+            )
+            return
+        try:
+            sessions = load_recent()
+        except (OSError, sqlite3.Error, ValueError):
+            LOGGER.exception("Unable to load saved sessions")
+            self.toasts.add_toast(Adw.Toast(title="Couldn’t read saved sessions"))
+            return
+        dialog = Adw.Dialog(
+            title="Saved Sessions", content_width=470, content_height=390
+        )
+        page = Adw.PreferencesPage()
+        group = Adw.PreferencesGroup(
+            description="Sessions are stored locally for up to seven days."
+            if sessions
+            else "There are no saved sessions."
+        )
+        for timestamp, events in sessions:
+            row = Adw.ActionRow(
+                title=f"{timestamp:%b %d, %H:%M:%S}",
+                subtitle=f"{len(events):,} retained events",
+                activatable=True,
+            )
+            row.add_suffix(Gtk.Image.new_from_icon_name("go-next-symbolic"))
+            row.connect("activated", self._open_session, dialog, timestamp, events)
+            group.add(row)
+        page.add(group)
+        toolbar = Adw.ToolbarView(content=page)
+        toolbar.add_top_bar(Adw.HeaderBar())
+        dialog.set_child(toolbar)
+        dialog.present(self)
+
+    def _open_session(self, _row, dialog, timestamp, events):
+        self._show_events(events)
+        self.session_status.set_label(f"Saved session · {timestamp:%b %d, %H:%M:%S}")
+        self.views.set_visible_child_name("timeline")
+        dialog.close()
+
+    def _confirm_clear_history(self, *_):
+        dialog = Adw.AlertDialog(
+            heading="Clear saved sessions?",
+            body="This removes all sessions stored on this device.",
+        )
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("clear", "Clear")
+        dialog.set_response_appearance("clear", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_close_response("cancel")
+        dialog.connect("response::clear", self._clear_history)
+        dialog.present(self)
+
+    def _clear_history(self, *_):
+        try:
+            clear_history()
+        except (OSError, sqlite3.Error):
+            LOGGER.exception("Unable to clear saved sessions")
+            self.toasts.add_toast(Adw.Toast(title="Couldn’t clear saved sessions"))
+            return
+        self.toasts.add_toast(Adw.Toast(title="Saved sessions cleared"))
 
     def _dropdown(self, names, description):
         dropdown = Gtk.DropDown.new_from_strings(names)
@@ -418,6 +774,16 @@ class Explorer(Adw.ApplicationWindow):
 
     def _toggle_pause(self, *_):
         self.paused = not self.paused
+        self.previous_diagnostics = None
+        self.rate_baseline = None
+        if self.session and self.session.active:
+            self.session.gap(
+                datetime.now().astimezone(),
+                "Snapshot monitoring paused"
+                if self.paused
+                else "Snapshot monitoring resumed",
+            )
+            self._update_session()
         if self.paused and self.in_flight and self.snapshot is not None:
             self.discard_pending = True
         self._set_pause_button()
@@ -426,6 +792,7 @@ class Explorer(Adw.ApplicationWindow):
             self._refresh()
 
     def _tick(self):
+        self._drain_trace()
         self._refresh()
         return GLib.SOURCE_CONTINUE
 
@@ -453,6 +820,25 @@ class Explorer(Adw.ApplicationWindow):
         if self.closed or self.discard_pending:
             return GLib.SOURCE_REMOVE
         self.error = snapshot is None
+        if self.session and self.session.active:
+            if snapshot is None:
+                self.session.gap(datetime.now().astimezone(), "Snapshot read failed")
+            elif snapshot.captured_at >= self.session_started_at:
+                last = self.session.last_snapshot_at
+                if (
+                    last
+                    and (snapshot.captured_at - last).total_seconds()
+                    > REFRESH_INTERVAL * 3
+                ):
+                    self.session.gap(
+                        snapshot.captured_at, "Snapshot sampling was interrupted"
+                    )
+                self.session.observe(snapshot)
+            self._update_session()
+        self.previous_diagnostics = self.rate_baseline if snapshot else None
+        self.rate_baseline = (
+            snapshot.diagnostics if snapshot and not self.paused else None
+        )
         if snapshot is not None:
             previous = self.snapshot
             self.snapshot = snapshot
@@ -477,6 +863,9 @@ class Explorer(Adw.ApplicationWindow):
         return GLib.SOURCE_REMOVE
 
     def _close(self, *_):
+        if self.session and self.session.active:
+            self._drain_trace()
+            self._finish_session()
         self.closed = True
         GLib.source_remove(self.timer)
         return False
@@ -485,7 +874,9 @@ class Explorer(Adw.ApplicationWindow):
         row = self.sorted.get_item(position)
         if row is None:
             return
-        connection = row.connection
+        self._show_socket(row.connection, live=True)
+
+    def _show_socket(self, connection, live=False):
         details = Adw.Dialog(title="Socket Details", content_width=500)
         page = Adw.PreferencesPage()
         process = Adw.PreferencesGroup(title="Process")
@@ -524,11 +915,100 @@ class Explorer(Adw.ApplicationWindow):
             )
         page.add(process)
         page.add(fields)
+        if live:
+            self._add_tcp_details(page, connection)
+        if live and connection.is_listener and connection.local:
+            self._add_listener_details(page, connection)
         toolbar = Adw.ToolbarView()
         toolbar.add_top_bar(Adw.HeaderBar())
         toolbar.set_content(page)
         details.set_child(toolbar)
         details.present(self)
+
+    def _add_tcp_details(self, page, connection):
+        if connection.protocol != "TCP" or connection.is_listener or self.demo:
+            return
+        diagnostics = self.snapshot.diagnostics
+        info = diagnostics.sockets.get(connection.inode) if diagnostics else None
+        group = Adw.PreferencesGroup(title="TCP Diagnostics")
+        page.add(group)
+        if not info:
+            group.set_description("Kernel counters are unavailable for this socket.")
+            return
+        group.set_description("TCP data sampled at the last refresh.")
+        values = [
+            (
+                "Round-trip time",
+                f"{info.rtt_ms:.2f} ms" if info.rtt_ms else "Unavailable",
+            ),
+            ("Retransmissions", f"{info.retransmissions:,}"),
+            ("Bytes acknowledged", f"{info.acked:,}"),
+            ("Bytes received", f"{info.received:,}"),
+        ]
+        previous = self.previous_diagnostics
+        speed = (
+            rates(
+                info,
+                previous.sockets.get(connection.inode),
+                diagnostics.sampled_at - previous.sampled_at,
+            )
+            if previous
+            else None
+        )
+        if speed is not None:
+            values.extend(
+                (
+                    ("Acknowledged send rate", f"{speed[0] / 1024:,.1f} KiB/s"),
+                    ("Receive rate", f"{speed[1] / 1024:,.1f} KiB/s"),
+                )
+            )
+        for title, value in values:
+            group.add(Adw.ActionRow(title=title, subtitle=value))
+
+    def _add_listener_details(self, page, connection):
+        group = Adw.PreferencesGroup(
+            title="Listener Context", description="Reading local configuration…"
+        )
+        page.add(group)
+
+        def apply(values):
+            if self.closed:
+                return GLib.SOURCE_REMOVE
+            group.set_description(
+                "External reachability is unknown. Zones shown are interface assignments."
+            )
+            for title, value in values:
+                group.add(
+                    Adw.ActionRow(
+                        title=title,
+                        subtitle=value or "Unavailable",
+                        use_markup=False,
+                        subtitle_selectable=True,
+                    )
+                )
+            return GLib.SOURCE_REMOVE
+
+        def read():
+            if self.demo:
+                values = (
+                    (
+                        "Bind scope",
+                        "All interfaces" if connection.is_wildcard else "Loopback",
+                    ),
+                    (
+                        "Systemd unit",
+                        "sshd.service" if connection.process == "sshd" else None,
+                    ),
+                )
+            else:
+                try:
+                    values = inspect_listener(connection)
+                except (OSError, ValueError):
+                    LOGGER.exception("Unable to read listener context")
+                    values = (("Listener context", None),)
+            GLib.idle_add(apply, values)
+
+        Thread(target=read, name="listener-context", daemon=True).start()
 
     def _show_shortcuts(self, *_):
         dialog = Adw.ShortcutsDialog()
@@ -556,14 +1036,15 @@ class Explorer(Adw.ApplicationWindow):
 
 
 class SocketForge(Adw.Application):
-    def __init__(self, demo=False):
+    def __init__(self, demo=False, trace=None):
         flags = (
             Gio.ApplicationFlags.NON_UNIQUE
-            if demo
+            if demo or trace is not None
             else Gio.ApplicationFlags.DEFAULT_FLAGS
         )
         super().__init__(application_id=APP_ID, flags=flags)
         self.demo = demo
+        self.trace = trace
 
     def do_startup(self):
         Adw.Application.do_startup(self)
@@ -580,5 +1061,5 @@ class SocketForge(Adw.Application):
     def do_activate(self):
         window = self.get_active_window()
         if window is None:
-            window = Explorer(self, self.demo)
+            window = Explorer(self, self.demo, self.trace)
         window.present()

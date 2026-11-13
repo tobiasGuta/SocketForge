@@ -1,11 +1,14 @@
 """Read an unprivileged snapshot of local IPv4 and IPv6 sockets."""
 
+import os
 import socket
 import time
 from dataclasses import dataclass
 from datetime import datetime
 
 import psutil
+
+from .diagnostics import Diagnostics, collect_tcp
 
 
 @dataclass(frozen=True, order=True)
@@ -29,6 +32,8 @@ class Connection:
     local: Endpoint | None
     remote: Endpoint | None
     state: str | None
+    started: float | None = None
+    inode: int | None = None
 
     @property
     def process_label(self):
@@ -68,6 +73,7 @@ class Connection:
 class Snapshot:
     connections: tuple[Connection, ...]
     captured_at: datetime
+    diagnostics: Diagnostics | None = None
 
     @property
     def listener_count(self):
@@ -82,15 +88,28 @@ def _process_details(pid, collection_started):
     try:
         process = psutil.Process(pid)
         with process.oneshot():
-            if process.create_time() > collection_started:
-                return None, None
+            started = process.create_time()
+            if started > collection_started:
+                return None, None, None
             name = process.name()
             try:
-                return name, process.exe() or None
+                return name, process.exe() or None, started
             except psutil.Error:
-                return name, None
+                return name, None, started
     except psutil.Error:
-        return None, None
+        return None, None, None
+
+
+def _socket_inode(pid, fd):
+    if pid is None or fd < 0:
+        return None
+    try:
+        target = os.readlink(f"/proc/{pid}/fd/{fd}")
+        if target.startswith("socket:[") and target.endswith("]"):
+            return int(target[8:-1])
+    except (OSError, ValueError):
+        pass
+    return None
 
 
 def _display_text(value):
@@ -111,7 +130,7 @@ def collect():
     for sock in sockets:
         if sock.pid is not None and sock.pid not in processes:
             processes[sock.pid] = _process_details(sock.pid, collection_started)
-        name, executable = processes.get(sock.pid, (None, None))
+        name, executable, started = processes.get(sock.pid, (None, None, None))
         # psutil 8 uses enum values. Earlier versions expose state as a string.
         state = getattr(sock.status, "value", sock.status)
         connections.append(
@@ -124,6 +143,8 @@ def collect():
                 local=Endpoint(*sock.laddr) if sock.laddr else None,
                 remote=Endpoint(*sock.raddr) if sock.raddr else None,
                 state=None if state == "NONE" else state,
+                started=started,
+                inode=_socket_inode(sock.pid, sock.fd) if started is not None else None,
             )
         )
 
@@ -135,6 +156,11 @@ def collect():
             row.local or Endpoint("", 0),
             row.remote or Endpoint("", 0),
             row.state or "",
+            row.inode or 0,
         )
     )
-    return Snapshot(tuple(connections), captured_at)
+    try:
+        diagnostics = collect_tcp()
+    except OSError:
+        diagnostics = None
+    return Snapshot(tuple(connections), captured_at, diagnostics)

@@ -80,3 +80,7 @@
 .socket-cell.numeric {
   font-variant-numeric: tabular-nums;
 }
+
+.event-row {
+  padding: 10px 14px;
+}

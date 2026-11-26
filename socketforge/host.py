@@ -13,23 +13,28 @@ UNITS = ("socketforge-tcp.service", "socketforge-udp.service")
 
 
 def read(cursor, started):
+    # Query loaded active units without systemctl show, which makes systemd
+    # transiently load and immediately unload missing optional units.
     state = subprocess.run(
-        ["/usr/bin/systemctl", "show", "--property=Id,ActiveState", *UNITS],
+        [
+            "/usr/bin/systemctl",
+            "list-units",
+            "--plain",
+            "--no-legend",
+            "--no-pager",
+            "--state=active",
+            "--type=service",
+            *UNITS,
+        ],
         check=True,
         capture_output=True,
         text=True,
         timeout=3,
     )
     active = {
-        group["Id"].split("-")[1].split(".")[0].upper()
-        for block in state.stdout.strip().split("\n\n")
-        if (
-            group := dict(
-                line.split("=", 1) for line in block.splitlines() if "=" in line
-            )
-        )
-        and group.get("Id") in UNITS
-        and group.get("ActiveState") == "active"
+        unit.split("-")[1].split(".")[0].upper()
+        for line in state.stdout.splitlines()
+        if (parts := line.split(None, 1)) and (unit := parts[0]) in UNITS
     }
     if not active and cursor is None:
         return cursor, [], active

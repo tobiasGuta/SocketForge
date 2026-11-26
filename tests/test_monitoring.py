@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
+from socketforge import host
 from socketforge.diagnostics import rates
 from socketforge.network import Connection, Endpoint, Snapshot, collect
 from socketforge.timeline import Session, clear_history, load_recent, save
@@ -120,3 +121,27 @@ class TraceTests(unittest.TestCase):
         self.assertEqual(str(event.connection.local), "[::1]:8080")
         self.assertEqual(parse("Possibly lost 12 samples").kind, "Trace event loss")
         self.assertIsNone(parse("header line"))
+
+
+class HostTests(unittest.TestCase):
+    def test_host_read_uses_list_units_and_parses_active_collectors(self):
+        calls = []
+
+        def fake_run(cmd, **_kwargs):
+            calls.append(cmd)
+            if cmd[1] == "list-units":
+                return unittest.mock.Mock(
+                    stdout="socketforge-tcp.service loaded active running TCP collector\n",
+                    stderr="",
+                )
+            return unittest.mock.Mock(stdout="", stderr="")
+
+        with (
+            patch("socketforge.host.subprocess.run", side_effect=fake_run),
+            patch("socketforge.host.psutil.net_if_addrs", return_value={}),
+        ):
+            cursor, events, active = host.read(None, 0)
+        self.assertIsNone(cursor)
+        self.assertEqual(events, [])
+        self.assertEqual(active, {"TCP"})
+        self.assertEqual(calls[0][1], "list-units")
